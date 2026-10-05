@@ -393,3 +393,64 @@ def test_the_export_says_whether_a_run_stopped_on_its_own_words(home, ending, sa
     assert r.returncode == 0, r.stderr
     p = next(s for s in json.loads((out / "data" / "sessions.json").read_text()) if s["p"] == PAINTER)
     assert p["said"] is said
+
+
+
+def png(w, h):
+    """A real w x h PNG, as base64 (the studio reads only its shape)."""
+    import base64
+    import struct
+    import zlib
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    rows = b"".join(b"\x00" + b"\x00\x00\x00" * w for _ in range(h))
+    raw = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+    return base64.b64encode(raw).decode()
+
+
+def ipython(i, code):
+    return line({"type": "message", "message": {"role": "assistant", "content": [
+        {"type": "toolCall", "id": i, "name": "ipython", "arguments": {"code": code}}]}})
+
+
+def attached(i, pictures):
+    """Prime Agent's reply to an attach_image call: the files it loaded, named in order, and their pictures."""
+    names = ", ".join(name for name, _ in pictures)
+    content = [{"type": "text", "text": f"Loaded {len(pictures)} image(s) into context: {names}"}]
+    content += [{"type": "image", "mimeType": "image/png", "data": data} for _, data in pictures]
+    return line({"type": "message", "message": {"role": "toolResult", "toolCallId": i, "isError": False, "content": content}})
+
+
+def test_pictures_a_prime_agent_painter_attaches_are_told_apart(home, server):
+    _, studio, log = home
+    canvas, crop, other = png(16, 10), png(12, 14), png(14, 8)
+    pictures = [  # (what the painter attached, what the studio should make of it: its look, a reference)
+        (("latest.png", canvas), ("", False)),
+        (("/tmp/ref/ww_small.jpg", other), (None, True)),
+        (("/Users/x/tmp/hyrule-research/gerudo/BotW_Gerudo_Town.png", other), (None, True)),
+        (("/tmp/ger_sheet.jpg", other), (None, True)),
+        (("c9_statue.png", crop), ("crop", False)),
+        (("latest.png", crop), ("crop", False)),
+        (("/tmp/val.png", canvas), ("mode value,squint", False)),
+        (("pal2.png", other), ("palette True", False)),
+        (("/Users/x/studio/out/easel/gerudo/gerudo.png", canvas), ("", False)),
+        (("lab_ice.png", canvas), (None, False)),
+        (("/tmp/studio_shot.png", other), (None, False)),
+    ]
+    log.write_text(start(str(studio)) + ipython("a1", "attach") + attached("a1", [p for p, _ in pictures]))
+    events = json.loads(server(f"/api/events?p={PAINTER}")[1])["events"]
+    shown = [(e["path"], (e.get("look"), e.get("ref", False))) for e in events if e["kind"] == "image"]
+    assert shown == [(p[0], want) for p, want in pictures]
+    assert all("look" not in e for e in events if e["kind"] == "image" and e["path"].endswith(("lab_ice.png", "studio_shot.png")))
+
+
+def test_the_picker_shows_a_prime_agent_painters_newest_whole_view_not_a_reference(home):
+    _, studio, log = home
+    canvas, ref = png(16, 10), png(14, 8)
+    log.write_text(start(str(studio))
+                   + ipython("a1", "x") + attached("a1", [("latest.png", canvas)])
+                   + ipython("a2", "y") + attached("a2", [("g_latest.png", canvas), ("c12_melons.png", png(5, 9))])
+                   + ipython("a3", "z") + attached("a3", [("/tmp/sheet.jpg", ref)]))
+    S._glances.clear()
+    assert S.glance([str(log)])["look"] == 1

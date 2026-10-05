@@ -17,6 +17,7 @@ timeline to scrub. Read-only: it never touches the painter.
 """
 import argparse
 import base64
+import struct
 import glob
 import http.server
 import json
@@ -255,10 +256,10 @@ def parse(path):
 
 def _parse(path):
     # changed: indices of events whose result came in after them, in arrival order (see stream())
-    c = _cache.setdefault(path, {"offset": 0, "events": [], "images": [], "calls": {}, "changed": [], "cwd": ""})
+    c = _cache.setdefault(path, {"offset": 0, "events": [], "images": [], "calls": {}, "changed": [], "cwd": "", "canvas": {}})
     size = os.path.getsize(path)
     if size < c["offset"]:  # rewritten
-        c.update(offset=0, events=[], images=[], calls={}, changed=[], cwd="")
+        c.update(offset=0, events=[], images=[], calls={}, changed=[], cwd="", canvas={})
     with open(path, "rb") as fh:
         fh.seek(c["offset"])
         chunk = fh.read()
@@ -305,6 +306,8 @@ def _parse(path):
                         ev.update(kind="edit", path=a.get("path", ""), edits=edits)
                     elif name in ("bash", "bg_start"):
                         ev.update(kind="cmd", text=a.get("command", ""))
+                    elif name == "ipython":  # prime-agent's one tool: Python that drives the easel through bash()
+                        ev.update(kind="cmd", text=a.get("code", ""))
                     elif name == "read":
                         ev.update(kind="read", path=a.get("path", ""))
                         if in_reference(ev["path"], c["cwd"]):
@@ -328,17 +331,28 @@ def _parse(path):
                 if m.get("isError"):
                     c["events"][parent]["err"] = True
                 c["changed"].append(parent)
-            for x in content:
-                if x.get("type") == "image" and x.get("data"):
-                    idx = len(c["images"])
-                    c["images"].append((x.get("mimeType", "image/jpeg"), x["data"]))
-                    src = c["events"][parent].get("path", "") if parent is not None else ""
-                    ev = {"ts": ts, "kind": "image", "img": idx, "path": src}
-                    if parent is not None and c["events"][parent]["kind"] == "look":
-                        ev["look"] = c["events"][parent]["text"]  # what the painter asked to see (see is_whole)
-                    if parent is not None and c["events"][parent].get("ref"):
-                        ev["ref"] = True  # a reference picture: never the painting
-                    c["events"].append(ev)
+            images = [x for x in content if x.get("type") == "image" and x.get("data")]
+            attached = []  # (path, look or REFERENCE) for each picture an ipython call attached
+            if images and parent is not None and c["events"][parent].get("name") == "ipython":
+                paths = attached_paths(txt)
+                looks = attached_looks(paths, [x["data"] for x in images], c["canvas"])
+                attached = list(zip(paths, looks)) + [("", REFERENCE)] * (len(images) - len(looks))
+            for k, x in enumerate(images):
+                idx = len(c["images"])
+                c["images"].append((x.get("mimeType", "image/jpeg"), x["data"]))
+                src = c["events"][parent].get("path", "") if parent is not None else ""
+                ev = {"ts": ts, "kind": "image", "img": idx, "path": src}
+                if k < len(attached):
+                    ev["path"], look = attached[k]
+                    if look is REFERENCE:
+                        ev["ref"] = True
+                    elif look is not None:
+                        ev["look"] = look
+                if parent is not None and c["events"][parent]["kind"] == "look":
+                    ev["look"] = c["events"][parent]["text"]  # what the painter asked to see (see is_whole)
+                if parent is not None and c["events"][parent].get("ref"):
+                    ev["ref"] = True  # a reference picture: never the painting
+                c["events"].append(ev)
         elif role == "user":
             t = _text(content)
             if t.strip():
@@ -371,6 +385,78 @@ def is_whole(look):
     return look is not None and not re.search(r"crop|mode|light|compare|(?:palette|survey) (?!False)", look)
 
 
+ATTACHING = object()  # in a glance's calls: an ipython call, whose reply may attach pictures (see attached_looks)
+REFERENCE = object()  # a reference picture (a glance's read of one, or a picture attached that isn't the canvas)
+
+
+# Prime Agent has no look tool: its `ipython` tool loads pictures with attach_image, whose reply names them in order
+# ("Loaded 2 image(s) into context: latest.png, /tmp/ref/ww.jpg"). What each one shows is read off where it lives and
+# the names its painter gives it:
+# - a reference: a file in a folder named ref, refs, reference(s) or one whose name holds "research", or a file whose
+#   name holds "sheet" (a contact sheet of references) or starts with "ref";
+# - the whole canvas: latest.png, g_latest.png, canvas*.png, an easel look (look-0007.png) or an easel render
+#   (out/easel/<session>/<name>.png), unless its shape says it's a crop;
+# - the canvas in grays or squinting: a name with "val", "value" or "squint";
+# - a crop: c<n>*.png, link*.png or a name with "crop"; the palette: a name starting with "pal".
+# Anything else (a test canvas, a sketch, a screenshot) is a picture it opened: neither the painting nor a reference.
+ATTACHED = re.compile(r"Loaded \d+ image\(s\) into context: (.*)")
+REFERENCE_DIR = re.compile(r"refs?|references?|.*research.*")
+REFERENCE_NAME = re.compile(r"ref.*|.*sheet.*")
+CANVAS_WHOLE = re.compile(r"(?:g_)?latest\.png|canvas[\w-]*\.png|look-\d+\.png")
+EASEL_RENDER = re.compile(r".*/out/easel/[^/]+/[^/]+\.png")
+CANVAS_VALUE = re.compile(r".*(?:val|squint).*\.png")
+CANVAS_PART = re.compile(r"c\d+\w*\.png|link\d*\.png|.*crop.*")
+
+
+def attached_paths(text):
+    """The files an attach_image reply loaded, in order ([] for any other reply)."""
+    m = ATTACHED.search(text or "")
+    return [p.strip() for p in m.group(1).split(", ")] if m else []
+
+
+def image_aspect(b64):
+    """Width / height of a base64 PNG or JPEG, or None if it is neither."""
+    data = base64.b64decode(b64)
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        w, h = struct.unpack(">II", data[16:24])
+        return w / h if h else None
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(data) and data[i] == 0xFF:
+            marker, size = data[i + 1], struct.unpack(">H", data[i + 2:i + 4])[0]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w / h if h else None
+            i += 2 + size
+    return None
+
+
+def attached_looks(paths, images_b64, canvas):
+    """What each attached picture shows: a look request ("" the whole canvas, "crop", "mode value,squint",
+    "palette True"), REFERENCE, or None for a picture it opened that is neither. canvas holds the canvas's shape
+    ("aspect"), learned from the first whole view and kept across calls."""
+    looks = []
+    for path, b64 in zip(paths, images_b64):
+        name, aspect = os.path.basename(path).lower(), image_aspect(b64)
+        folders = os.path.dirname(path).lower().split("/")
+        if canvas.get("aspect") is None and aspect is not None and CANVAS_WHOLE.fullmatch(name):
+            canvas["aspect"] = aspect
+        same_shape = aspect is not None and canvas.get("aspect") is not None and abs(aspect / canvas["aspect"] - 1) < 0.03
+        if any(REFERENCE_DIR.fullmatch(f) for f in folders) or REFERENCE_NAME.fullmatch(name):
+            looks.append(REFERENCE)
+        elif name.startswith("pal"):
+            looks.append("palette True")
+        elif CANVAS_VALUE.fullmatch(name):
+            looks.append("mode value,squint" if same_shape else "crop, mode value")
+        elif CANVAS_WHOLE.fullmatch(name) or EASEL_RENDER.fullmatch(path.lower()):
+            looks.append("" if same_shape else "crop")
+        elif CANVAS_PART.fullmatch(name):
+            looks.append("crop")
+        else:
+            looks.append(None)
+    return looks
+
+
 # a closing reply that begins with the painting's title: "**The Silent Shore**", "### *Hünengrab im Abendlicht* (...)",
 # also after an opening kaomoji ("(ᵔᴥᵔ) **The Old Willow at Evening**")
 TITLE = re.compile(r"\s*(?:\([^)\n]{1,16}\)\S{0,3}\s+)?(?:#{1,6}\s*)?(\*\*?|__?)([^*_\n]{2,100}?)\1(?![*_\w])")
@@ -391,7 +477,6 @@ def title_of(say):
     return None
 
 
-REFERENCE = object()  # in a glance's calls: a read of a reference picture
 _warm = None  # the server's first scan of every painter for the picker: set when done (None: scan on request)
 _glances = {}  # path -> what the picker needs from one session file, read incrementally without keeping images
 
@@ -405,7 +490,8 @@ def _glance_file(path):
         g = _glances.get(path)
         size = os.path.getsize(path)
         if not g or size < g["offset"]:
-            g = _glances[path] = {"offset": 0, "calls": {}, "n": 0, "whole": None, "last": None, "say": "", "cwd": ""}
+            g = _glances[path] = {"offset": 0, "calls": {}, "n": 0, "whole": None, "last": None, "say": "", "cwd": "",
+                                  "canvas": {}}
         with open(path, "rb") as fh:
             fh.seek(g["offset"])
             while True:
@@ -431,17 +517,22 @@ def _glance_file(path):
                             a = x.get("arguments") or {}
                             g["calls"][x.get("id")] = (look_text(a) if x.get("name") == "look" else REFERENCE
                                                        if x.get("name") == "read" and in_reference(a.get("path", ""), g["cwd"])
-                                                       else None)
+                                                       else ATTACHING if x.get("name") == "ipython" else None)
                 elif m.get("role") == "toolResult":
                     look, k = g["calls"].get(m.get("toolCallId")), 0
-                    for x in content:
-                        if x.get("type") == "image" and x.get("data"):
-                            if look is None:
-                                g["last"] = (g["n"], at, k)
-                            elif look is not REFERENCE and is_whole(look):
-                                g["whole"] = (g["n"], at, k)
-                            g["n"] += 1
-                            k += 1
+                    images = [x for x in content if x.get("type") == "image" and x.get("data")]
+                    looks = [look] * len(images)
+                    if look is ATTACHING and images:
+                        paths = attached_paths(_text(content))
+                        looks = attached_looks(paths, [x["data"] for x in images], g["canvas"])
+                        looks += [REFERENCE] * (len(images) - len(looks))
+                    for look in looks:
+                        if look is None:
+                            g["last"] = (g["n"], at, k)
+                        elif look is not REFERENCE and is_whole(look):
+                            g["whole"] = (g["n"], at, k)
+                        g["n"] += 1
+                        k += 1
         return g
 
 

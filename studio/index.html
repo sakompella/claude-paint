@@ -145,6 +145,17 @@
   #pos { font:12px var(--mono); color:var(--dim); min-width:9ch; text-align:right }
   #zoom { position:fixed; inset:0; background:rgba(0,0,0,.94); display:none; align-items:center; justify-content:center; cursor:zoom-out; z-index:9 }
   #zoom img { max-width:98vw; max-height:98vh }
+  /* the references: every picture it studied that isn't its painting, once each */
+  #refs { position:fixed; z-index:7; top:52px; right:12px; width:min(780px, calc(100vw - 24px)); max-height:calc(100vh - 190px); overflow:auto; overscroll-behavior:contain;
+          background:#17171c; border:1px solid #33333d; border-radius:10px; padding:10px 12px 14px; box-shadow:0 16px 48px rgba(0,0,0,.65) }
+  #refsclose { padding:2px 9px }
+  #reflist { display:grid; grid-template-columns:repeat(auto-fill, minmax(170px, 1fr)); gap:10px }
+  .refcard { cursor:pointer; background:#1f1f25; border-radius:6px; padding:6px 6px 8px; border-bottom:3px solid var(--ref) }
+  .refcard:hover, .refcard.on { outline:2px solid var(--acc); outline-offset:1px }
+  .refcard img { display:block; width:100%; height:110px; object-fit:contain; background:#0b0b0d; border-radius:3px }
+  .refcard b { display:block; margin-top:5px; font-size:12px; font-weight:600; color:var(--fg); overflow-wrap:anywhere }
+  .refcard span { font-size:11px; color:var(--dim) }
+  #togglerefs { color:var(--ref) } #nrefs { font:11px var(--mono) }
 
   /* phone: stacked panes, touch transport, home-indicator safe area. LAST in the sheet so it
      overrides the base rules above (equal specificity, later wins). The 1920px stream is untouched. */
@@ -208,6 +219,7 @@
     <div id="scrubwrap"><input type="range" id="scrub" min="0" max="0" value="0"><div id="ticks"></div></div>
     <span id="pos"></span>
     <button id="togglecode" title="show/hide code  c">code</button>
+    <button id="togglerefs" hidden title="the reference pictures it studied  r">refs <span id="nrefs"></span></button>
     <button id="golive" title="jump to live  l">● LIVE</button>
   </div>
 </footer>
@@ -216,6 +228,11 @@
     <label id="allwrap" title="also show sessions that aren't painters (judges, tests, work on the project)"><input type="checkbox" id="all"> all sessions</label>
     <button id="pkclose" type="button" aria-label="close">✕</button></div>
   <div id="pklist"></div>
+</div>
+<div id="refs" hidden role="dialog" aria-label="Reference pictures">
+  <div class="pkhead"><b>References</b><span>pictures it studied that aren't its own painting: choose one to see when it looked</span><span class="sp"></span>
+    <button id="refsclose" type="button" aria-label="close">✕</button></div>
+  <div id="reflist"></div>
 </div>
 <div id="zoom"><img id="zimg" alt=""></div>
 <div id="intro" hidden role="dialog" aria-label="About the studio">
@@ -393,7 +410,7 @@ async function loadSessions() {
 }
 $('all').onchange = () => { localStorage.setItem('studio.all', $('all').checked ? '1' : '0'); renderPicker(); };
 let gen = 0, busy = false;  // one poll at a time; a reset (new painter, rebuilt stream) makes in-flight polls stale
-function reset() { gen++; busy = false; staticV = null; stop(); events = []; nUpd = 0; epoch = null; cwd = ''; liveText = null; typed = -1; sitStarts = [0]; nSittings = 1; hasLooks = false; $('strip').innerHTML = ''; $('ticks').innerHTML = ''; noPicture(); }
+function reset() { gen++; busy = false; staticV = null; stop(); events = []; nUpd = 0; epoch = null; cwd = ''; liveText = null; typed = -1; sitStarts = [0]; nSittings = 1; hasLooks = false; $('strip').innerHTML = ''; $('ticks').innerHTML = ''; noPicture(); renderRefs(); }
 const NOPIC = "No picture yet: the painter hasn't looked at its canvas.<br>Its first look will show here.";
 function noPainting() { $('nopic').innerHTML = NOPIC; $('nopic').hidden = !events.length; clearPic($('img')); $('cap').textContent = ''; viewI = -1; }  // the painting's place, empty
 function noPicture() { noPainting(); second(-1); palette(-1); $('zimg').removeAttribute('src'); $('zoom').style.display = 'none'; }
@@ -426,9 +443,9 @@ async function poll() {
     for (const e of r.events) if (e.kind === 'start') cwd = e.cwd;
     $('scrub').max = events.length - 1;
     const f = document.createDocumentFragment();  // (the strip's new thumbnails, added at once)
-    r.events.forEach((e, j) => { if (e.kind === 'image') thumb(e, base + j, f); else if (e.kind === 'look') hasLooks = true; else if (e.kind === 'sitting') { sitStarts.push(base + j); sitDivider(e, base + j, f); } });
+    r.events.forEach((e, j) => { if (e.kind === 'image') { thumb(e, base + j, f); if (e.look !== undefined) hasLooks = true; } else if (e.kind === 'look') hasLooks = true; else if (e.kind === 'sitting') { sitStarts.push(base + j); sitDivider(e, base + j, f); } });
     $('strip').appendChild(f); if (live) stripEnd();  // (fixed thumbnail sizes in the CSS: the strip's width is known before they load)
-    ticks();
+    ticks(); renderRefs();
     if (live) show(events.length - 1);
     if (!base && !allSessions.some(s => qOf(s) === Q)) loadSessions();  // a painter that has just begun: its name for the header
   }
@@ -484,7 +501,7 @@ function kindOf(e) {
     return /\.(rs|lua)$/.test(f) ? ['code', '✍️', (e.kind === 'write' ? 'wrote ' : 'edited ') + f + d] : /\.md$/.test(f) ? ['notes', '📝', (e.kind === 'write' ? 'wrote ' : 'edited ') + f] : ['code', '✍️', 'wrote ' + f];
   }
   if (e.kind === 'read') return e.ref && /\.(jpe?g|png|webp|gif)$/i.test(f) ? ['ref', '🖼', 'studies a reference picture'] : /\.(jpe?g|png)$/i.test(f) ? ['look', '👁', 'looks at the canvas'] : ['read', '📖', 'reads ' + f];
-  if (e.kind === 'image') return e.ref ? ['ref', '🖼', 'studies a reference picture'] : ['look', '👁', 'looks at ' + (f || 'the canvas')];
+  if (e.kind === 'image') return e.ref ? ['ref', '🖼', f ? 'studies a reference: ' + f : 'studies a reference picture'] : ['look', '👁', 'looks at ' + (f || 'the canvas')];
   if (e.kind === 'look') return ['look', '👁', lookWords(e.text)[2]];
   if (e.kind === 'clock') return ['notes', '◷', 'painting clock'];
   if (e.kind === 'paint') { const ok = paintOK(e);
@@ -739,7 +756,7 @@ function second(k) {
     setPic($('img2'), [u, imgURL(e.img), thumbURL(e.img)]);
     $('cap2').querySelector('b').textContent = t; crop = e.ref ? null : cropOf(e.look);
     const sq = !e.ref && /squint|blur/.test(e.look || ''), gray = !e.ref && /value|gray/.test(e.look || ''), by = e.ref && why.match(/^A painting by (.+?) that/);
-    $('cap2').querySelector('span').textContent = e.ref ? (by ? 'a painting by ' + by[1] : '') : [sq && 'blurred on purpose', gray && 'in grays'].filter(Boolean).join(', ');
+    $('cap2').querySelector('span').textContent = e.ref ? (by ? 'a painting by ' + by[1] : fname(e.path)) : [sq && 'blurred on purpose', gray && 'in grays'].filter(Boolean).join(', ');
     $('cap2').title = e.ref ? why : `What the painter is looking at now${why ? ': ' + why : ''}${crop ? '. Outlined on the painting.' : '.'}`;
     $('img2').alt = e.ref ? 'a reference picture' : t; }
   else clearPic($('img2'));
@@ -816,6 +833,24 @@ $('prevlook').onclick = () => { stop(); live = false; const L = looks().filter(k
 $('nextlook').onclick = () => { stop(); const L = looks().filter(k => k > pos); if (L.length) { live = false; show(L[0]); } else goLive(); };
 $('golive').onclick = goLive;
 $('scrub').oninput = e => { stop(); live = +e.target.value >= events.length - 1; show(+e.target.value); };
+// ---- references: every picture it studied that isn't its painting, once each, in the order it first looked
+function refList() {
+  const by = new Map();
+  events.forEach((e, k) => { if (e.kind !== 'image' || !e.ref) return; const key = e.path || 'img ' + e.img, r = by.get(key);
+    if (r) r.n++; else by.set(key, { k, n: 1, e }); });
+  return [...by.values()];
+}
+function renderRefs() {
+  const rs = refList(); $('togglerefs').hidden = !rs.length; $('nrefs').textContent = rs.length;
+  if (!rs.length) $('refs').hidden = true;
+  if ($('refs').hidden) return;
+  $('reflist').innerHTML = rs.map(r => `<div class="refcard${r.k === otherK ? ' on' : ''}" data-i="${r.k}" title="${esc(r.e.path || '')}">` +
+    `<img loading="lazy" src="${thumbURL(r.e.img)}" alt=""><b>${esc(fname(r.e.path) || 'a reference picture')}</b>` +
+    `<span>${hhmm(r.e.ts)}${r.n > 1 ? ` · studied ${r.n} times` : ''}</span></div>`).join('');
+}
+$('togglerefs').onclick = () => { $('refs').hidden = !$('refs').hidden; renderRefs(); };
+$('refsclose').onclick = () => { $('refs').hidden = true; };
+$('reflist').onclick = e => { const c = e.target.closest('.refcard'); if (!c) return; live = false; stop(); show(+c.dataset.i); renderRefs(); };
 $('togglecode').onclick = () => { document.body.classList.toggle('nocode'); if (codeShown() && events.length) { codeAt(pos); if (live) refreshLiveCode(); } };
 $('img').onclick = () => { $('zimg').src = viewI >= 0 ? imgURL(viewI) : $('img').src; $('zoom').style.display = 'flex'; };
 $('img2').onclick = () => { $('zimg').src = viewI2 >= 0 ? imgURL(viewI2) : $('img2').src; $('zoom').style.display = 'flex'; };
@@ -827,8 +862,8 @@ document.onkeydown = e => {
   if (t.tagName === 'BUTTON' && t.id !== 'play' && (k === ' ' || k === 'Enter')) return;  // the focused button's own action
   // (the right arrow reaching the end is at the end, as the scrub bar is: live again, or at rest)
   if (k === 'ArrowRight') { if (pos + 1 >= events.length - 1) goLive(); else { stop(); live = false; show(pos + 1); } } else if (k === 'ArrowLeft') { stop(); live = false; show(pos - 1); }
-  else if (k === '[') $('prevlook').click(); else if (k === ']') $('nextlook').click(); else if (k === 'l') goLive(); else if (k === 'c') $('togglecode').click();
-  else if (k === 'Escape') $('zoom').style.display = 'none'; else if (k === ' ') { e.preventDefault(); $('play').click(); } };
+  else if (k === '[') $('prevlook').click(); else if (k === ']') $('nextlook').click(); else if (k === 'l') goLive(); else if (k === 'c') $('togglecode').click(); else if (k === 'r' && !$('togglerefs').hidden) $('togglerefs').click();
+  else if (k === 'Escape') { $('zoom').style.display = 'none'; $('refs').hidden = true; } else if (k === ' ') { e.preventDefault(); $('play').click(); } };
 Promise.all([loadGallery(), loadSessions()]).then(() => { renderHeader(); if ($('picker').hidden) renderPicker(); glimpse(); poll(); setInterval(poll, 2000);
   setInterval(() => { status(); if (events.length && resting() !== rested) pictures(); }, 1000);  // (a page left open comes to rest on its own when the painter stops)
   setInterval(loadSessions, 30000); });
